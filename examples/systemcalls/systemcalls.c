@@ -48,6 +48,8 @@ bool do_exec(int count, ...)
     }
     command[count] = NULL;
 
+    fflush(stdout); // Flush stdout before forking
+
     pid_t pid = fork();
     if (pid == -1) {
         va_end(args);
