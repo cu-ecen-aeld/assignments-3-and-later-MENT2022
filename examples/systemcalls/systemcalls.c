@@ -88,6 +88,8 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         return false;
     }
 
+    fflush(stdout); // Flush stdout before forking
+
     pid_t pid = fork();
     if (pid == -1) {
         close(fd);
