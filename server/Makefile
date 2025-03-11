@@ -3,13 +3,14 @@
 # For example: make CC=arm-linux-gnueabihf-gcc
 
 CC ?= gcc
-CFLAGS := -Wall -Wextra -Werror -std=gnu11
+CFLAGS := -Wall -Wextra -std=gnu11
+LDFLAGS := -pthread
 TARGET := aesdsocket
 
 all: $(TARGET)
 
 $(TARGET): aesdsocket.o
-	$(CC) $(CFLAGS) -o $(TARGET) aesdsocket.o
+	$(CC) $(CFLAGS) -o $(TARGET) aesdsocket.o $(LDFLAGS)
 
 aesdsocket.o: aesdsocket.c
 	$(CC) $(CFLAGS) -c aesdsocket.c -o aesdsocket.o

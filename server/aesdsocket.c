@@ -11,12 +11,15 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/select.h>
+#include <pthread.h>
+#include <time.h>
 
 #define PORT "9000" // Port as a string for getaddrinfo
 #define BUFFER_SIZE 1024
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 
 volatile sig_atomic_t stop_flag = 0;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Signal handler for SIGINT and SIGTERM
 void handle_signal(int signum) {
@@ -25,6 +28,106 @@ void handle_signal(int signum) {
         syslog(LOG_INFO, "Caught signal, exiting");
         printf("Caught signal %d, exiting...\n", signum);
     }
+}
+
+// Thread function to handle client connections
+void *handle_client(void *arg) {
+    int client_fd = *(int *)arg;
+    free(arg); // Free the allocated memory for client_fd
+    
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_read;
+    char *complete_packet = NULL;
+    size_t packet_size = 0;
+
+    // Read data until newline is found
+    while ((bytes_read = recv(client_fd, buffer, BUFFER_SIZE - 1, 0)) > 0) {
+        buffer[bytes_read] = '\0';
+        
+        // Append to complete packet
+        char *new_packet = realloc(complete_packet, packet_size + bytes_read + 1);
+        if (!new_packet) {
+            syslog(LOG_ERR, "Memory allocation failed");
+            free(complete_packet);
+            close(client_fd);
+            return NULL;
+        }
+        
+        complete_packet = new_packet;
+        memcpy(complete_packet + packet_size, buffer, bytes_read);
+        packet_size += bytes_read;
+        
+        // Check if packet contains newline
+        if (strchr(buffer, '\n'))
+            break;
+    }
+    
+    if (bytes_read < 0) {
+        syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+        free(complete_packet);
+        close(client_fd);
+        return NULL;
+    }
+    
+    // Write to file with mutex protection
+    pthread_mutex_lock(&file_mutex);
+    FILE *data_file = fopen(DATA_FILE, "a+");
+    if (!data_file) {
+        syslog(LOG_ERR, "Failed to open data file: %s", strerror(errno));
+        pthread_mutex_unlock(&file_mutex);
+        free(complete_packet);
+        close(client_fd);
+        return NULL;
+    }
+    
+    // Write the complete packet
+    if (complete_packet && packet_size > 0) {
+        fwrite(complete_packet, 1, packet_size, data_file);
+        fflush(data_file);
+    }
+    
+    // Read the entire file and send back to client
+    rewind(data_file);
+    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, data_file)) > 0) {
+        if (send(client_fd, buffer, bytes_read, 0) < 0) {
+            syslog(LOG_ERR, "send failed: %s", strerror(errno));
+            break;
+        }
+    }
+    
+    fclose(data_file);
+    pthread_mutex_unlock(&file_mutex);
+    
+    free(complete_packet);
+    close(client_fd);
+    syslog(LOG_INFO, "Closed connection from client");
+    
+    return NULL;
+}
+
+// Timer thread function to append timestamps
+void *timestamp_thread(void *arg) {
+    (void)arg; // Explicitly mark the parameter as unused
+    while (!stop_flag) {
+        sleep(10); // Wait for 10 seconds
+
+        pthread_mutex_lock(&file_mutex); // Lock the mutex
+        FILE *data_file = fopen(DATA_FILE, "a");
+        if (!data_file) {
+            syslog(LOG_ERR, "Failed to open data file: %s", strerror(errno));
+            pthread_mutex_unlock(&file_mutex); // Unlock the mutex
+            continue;
+        }
+
+        time_t now = time(NULL);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%a, %d %b %Y %H:%M:%S %z", localtime(&now));
+        fprintf(data_file, "timestamp:%s\n", timestamp);
+        fflush(data_file);
+        fclose(data_file);
+        pthread_mutex_unlock(&file_mutex); // Unlock the mutex
+    }
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -40,9 +143,6 @@ int main(int argc, char *argv[]) {
     struct addrinfo hints, *res;
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
-    char buffer[BUFFER_SIZE];
-    ssize_t bytes_read;
-    FILE *data_file = NULL;
 
     // Configure hints for getaddrinfo
     memset(&hints, 0, sizeof(hints));
@@ -97,6 +197,16 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // Create data file or truncate if it exists
+    FILE *data_file = fopen(DATA_FILE, "w");
+    if (!data_file) {
+        syslog(LOG_ERR, "Failed to create data file: %s", strerror(errno));
+        printf("Failed to create data file: %s\n", strerror(errno));
+        close(server_fd);
+        return -1;
+    }
+    fclose(data_file);
+
     // Daemonize if requested
     if (daemon_mode) {
         pid_t pid = fork();
@@ -110,7 +220,10 @@ int main(int argc, char *argv[]) {
             return 0;
         }
         // Child process continues
-        chdir("/");
+        if (chdir("/") != 0) {
+            perror("chdir failed");
+            exit(EXIT_FAILURE);
+        }
         setsid();
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
@@ -120,6 +233,15 @@ int main(int argc, char *argv[]) {
     // Handle signals
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    // Create timestamp thread
+    pthread_t timestamp_tid;
+    if (pthread_create(&timestamp_tid, NULL, timestamp_thread, NULL) != 0) {
+        syslog(LOG_ERR, "Failed to create timestamp thread");
+        printf("Failed to create timestamp thread\n");
+        close(server_fd);
+        return -1;
+    }
 
     while (!stop_flag) {
         // Use select to make accept non-blocking
@@ -160,46 +282,33 @@ int main(int argc, char *argv[]) {
         syslog(LOG_INFO, "Accepted connection from %s", client_ip);
         printf("Accepted connection from %s\n", client_ip);
 
-        // Receive data and append to file
-        data_file = fopen(DATA_FILE, "a");
-        if (!data_file) {
-            syslog(LOG_ERR, "Failed to open data file: %s", strerror(errno));
-            printf("Failed to open data file: %s\n", strerror(errno));
+        // Create a new thread to handle the client
+        pthread_t tid;
+        int *client_fd_ptr = malloc(sizeof(int));
+        if (!client_fd_ptr) {
+            syslog(LOG_ERR, "Failed to allocate memory");
             close(client_fd);
             continue;
         }
-
-        while ((bytes_read = read(client_fd, buffer, BUFFER_SIZE)) > 0) {
-            fwrite(buffer, 1, bytes_read, data_file);
-            if (memchr(buffer, '\n', bytes_read)) {
-                break; // End of packet
-            }
-        }
-        fclose(data_file);
-
-        // Send file content back to client
-        data_file = fopen(DATA_FILE, "r");
-        if (!data_file) {
-            syslog(LOG_ERR, "Failed to open data file for reading: %s", strerror(errno));
-            printf("Failed to open data file for reading: %s\n", strerror(errno));
+        *client_fd_ptr = client_fd;
+        if (pthread_create(&tid, NULL, handle_client, client_fd_ptr) != 0) {
+            syslog(LOG_ERR, "Failed to create thread for client");
+            printf("Failed to create thread for client\n");
+            free(client_fd_ptr);
             close(client_fd);
             continue;
         }
-
-        while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, data_file)) > 0) {
-            write(client_fd, buffer, bytes_read);
-        }
-        fclose(data_file);
-
-        // Log connection closure
-        syslog(LOG_INFO, "Closed connection from %s", client_ip);
-        printf("Closed connection from %s\n", client_ip);
-        close(client_fd);
+        pthread_detach(tid); // Detach thread to avoid memory leaks
     }
+
+    // Wait for timestamp thread to finish
+    pthread_cancel(timestamp_tid);
+    pthread_join(timestamp_tid, NULL);
 
     // Cleanup
     close(server_fd);
     remove(DATA_FILE);
+    pthread_mutex_destroy(&file_mutex);
     closelog();
     printf("Server shutdown gracefully.\n");
 
